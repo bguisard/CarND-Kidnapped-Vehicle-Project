@@ -1,9 +1,9 @@
 /*
  *  particle_filter.cpp
- *  purpose: 
+ *  purpose: Uses a 2D particle filter to localize a car in a map
  *
  *  @author Bruno Guisard
- *  @version 0.1 6/20/2017
+ *  @version 0.1 6/21/2017
  */
 
 #include <random>
@@ -20,14 +20,11 @@
 
 using namespace std;
 
+// Initializes the N particles to be determined by num_particles
 void ParticleFilter::init(double x, double y, double theta, double std[]) {
-  // TODO: Set the number of particles. Initialize all particles to first position (based on estimates of 
-  //   x, y, theta and their uncertainties from GPS) and all weights to 1. 
-  // Add random Gaussian noise to each particle.
-  // NOTE: Consult particle_filter.h for more information about this method (and others in this file).
 
-  // MY CODE BEGINS HERE:
-  num_particles = 20; // This will probably need to be optimized later. I just guessed for now
+  // User defined number of particles => Directly impacts algorithm performance
+  num_particles = 10;
 
   // Initializes a random generator to assist in our gaussian sampling
   default_random_engine gen;
@@ -52,19 +49,27 @@ void ParticleFilter::init(double x, double y, double theta, double std[]) {
 
 }
 
+// Predicts position of each particle given delta_t, noises, velocity and yaw rate 
 void ParticleFilter::prediction(double delta_t, double std_pos[], double velocity, double yaw_rate) {
-  // TODO: Add measurements to each particle and add random Gaussian noise.
-  // NOTE: When adding noise you may find std::normal_distribution and std::default_random_engine useful.
-  //  http://en.cppreference.com/w/cpp/numeric/random/normal_distribution
-  //  http://www.cplusplus.com/reference/random/default_random_engine/
 
   // Initializes a random generator to assist in our gaussian sampling
   default_random_engine gen;
 
+    double new_theta;
+    double new_x_mean;
+    double new_y_mean;
+
   for (int i = 0; i < num_particles; i++) {
-    double new_theta = particles[i].theta + yaw_rate * delta_t; // storing it for efficiency
-    double new_x_mean = particles[i].x + (velocity / yaw_rate) * (sin(new_theta) - sin(particles[i].theta));
-    double new_y_mean = particles[i].y + (velocity / yaw_rate) * (cos(particles[i].theta) - cos(new_theta));
+
+    if (fabs(yaw_rate) < 0.0001) {
+      new_theta = particles[i].theta;
+      new_x_mean = particles[i].x + (velocity * delta_t * cos(new_theta));
+      new_y_mean = particles[i].y + (velocity * delta_t * sin(new_theta));
+    } else {
+      new_theta = particles[i].theta + yaw_rate * delta_t;
+      new_x_mean = particles[i].x + (velocity / yaw_rate) * (sin(new_theta) - sin(particles[i].theta));
+      new_y_mean = particles[i].y + (velocity / yaw_rate) * (cos(particles[i].theta) - cos(new_theta));
+    }
 
     // Creates normal distribution for each parameter: x, y and theta
     normal_distribution<double> dist_x(new_x_mean, std_pos[0]);
@@ -77,6 +82,7 @@ void ParticleFilter::prediction(double delta_t, double std_pos[], double velocit
   }
 }
 
+// Unused - to be deleted
 void ParticleFilter::dataAssociation(std::vector<LandmarkObs> predicted, std::vector<LandmarkObs>& observations) {
   // TODO: Find the predicted measurement that is closest to each observed measurement and assign the 
   //   observed measurement to this particular landmark.
@@ -85,26 +91,119 @@ void ParticleFilter::dataAssociation(std::vector<LandmarkObs> predicted, std::ve
 
 }
 
+// Calculates weights for each individual particle
 void ParticleFilter::updateWeights(double sensor_range, double std_landmark[], 
     std::vector<LandmarkObs> observations, Map map_landmarks) {
-  // TODO: Update the weights of each particle using a mult-variate Gaussian distribution. You can read
-  //   more about this distribution here: https://en.wikipedia.org/wiki/Multivariate_normal_distribution
-  // NOTE: The observations are given in the VEHICLE'S coordinate system. Your particles are located
-  //   according to the MAP'S coordinate system. You will need to transform between the two systems.
-  //   Keep in mind that this transformation requires both rotation AND translation (but no scaling).
-  //   The following is a good resource for the theory:
-  //   https://www.willamette.edu/~gorr/classes/GeneralGraphics/Transforms/transforms2d.htm
-  //   and the following is a good resource for the actual equation to implement (look at equation 
-  //   3.33
-  //   http://planning.cs.uiuc.edu/node99.html
+
+  // NAIVE WAY - CAN BE OPTIMIZED LATER
+  // STEPS: 
+  //  1 - For each particle convert measurements to map coordinate
+  //  2 - For each observation find the closest landmark
+  //  3 - Calculate error for the pair obs x best landmark
+  //  4 - Accumulate error for particle
+  
+  // variable to store coords converted to map scale
+  LandmarkObs converted_obs;
+  LandmarkObs best_landmark;
+
+  // clears weight vector
+  weights.clear();
+
+  // loop through all particles
+  for (int i = 0; i < int(particles.size()); i++) {
+    double prob = 1.;
+
+    // loop through all observations
+    for (int k = 0; k < int(observations.size()); k++) {
+      //  1 - For each particle convert measurements to map coordinate
+      converted_obs = transformCoords(particles[i], observations[k]);
+
+      //  2 - Assign observation to a landmark
+      best_landmark = associateLandmark(converted_obs, map_landmarks, std_landmark);
+
+      //  3 - Calculate weight for the pair obs x best landmark
+      double e = calculateWeights(converted_obs, best_landmark, std_landmark);
+
+      //  4 - Accumulate weights for particle
+      prob *= e;
+    }
+
+    // store weight in particle
+    particles[i].weight = prob;
+
+    // and in the weights vector
+    weights.push_back(prob);
+
+  }
 }
 
+// Weight based resampling the particles with replacement, allowing more relevant particles to be picked more frequently
 void ParticleFilter::resample() {
-  // TODO: Resample particles with replacement with probability proportional to their weight. 
-  // NOTE: You may find std::discrete_distribution helpful here.
-  //   http://en.cppreference.com/w/cpp/numeric/random/discrete_distribution
 
+  std::vector<Particle> new_particles;
+  int index;
+
+  // Initializes discrete distribution function
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::discrete_distribution<int> weight_distribution(weights.begin(), weights.end());
+
+  for (int i = 0; i < num_particles; i++) {
+    index = weight_distribution(gen);
+    new_particles.push_back(particles[index]);
+  }
+  particles = new_particles;
 }
+
+// Convert coordinates from particle to map 
+LandmarkObs ParticleFilter::transformCoords(Particle part, LandmarkObs obs) {
+
+  LandmarkObs transformed_coords;
+
+  transformed_coords.id = obs.id;
+  transformed_coords.x = obs.x * cos(part.theta) - obs.y * sin(part.theta) + part.x;
+  transformed_coords.y = obs.x * sin(part.theta) + obs.y * cos(part.theta) + part.y;
+
+  return transformed_coords;
+}
+
+// Naive association of landmark to particle
+LandmarkObs ParticleFilter::associateLandmark(LandmarkObs converted_obs, Map map_landmarks, double std_landmark[]) {
+  LandmarkObs best_landmark;
+
+  for (int m = 0; m < int(map_landmarks.landmark_list.size()); m++) {
+    double min_dist;
+    double distance = dist(converted_obs.x, converted_obs.y, map_landmarks.landmark_list[m].x_f, map_landmarks.landmark_list[m].y_f);
+    if (m==0) {
+      min_dist = distance;
+      best_landmark.id = map_landmarks.landmark_list[m].id_i;
+      best_landmark.x = map_landmarks.landmark_list[m].x_f;
+      best_landmark.y = map_landmarks.landmark_list[m].y_f;
+    } else if (distance < min_dist) {
+      min_dist = distance;
+      best_landmark.id = map_landmarks.landmark_list[m].id_i;
+      best_landmark.x = map_landmarks.landmark_list[m].x_f;
+      best_landmark.y = map_landmarks.landmark_list[m].y_f;
+    }
+  }
+
+  return best_landmark;
+}
+
+// Calculates the error between the estimated position and the ground truth position of the landmark
+double ParticleFilter::calculateWeights(LandmarkObs obs, LandmarkObs best_landmark, double std_landmark[]) {
+
+  // storing for readability
+  const double sigma_x = std_landmark[0];
+  const double sigma_y = std_landmark[1];
+  const double d_x = obs.x - best_landmark.x;
+  const double d_y = obs.y - best_landmark.y;
+
+  double e = (1/(2. * M_PI * sigma_x * sigma_y)) * exp(-((d_x * d_x / (2 * sigma_x * sigma_x)) + (d_y * d_y / (2 * sigma_y * sigma_y))));
+
+  return e;
+}
+
 
 Particle ParticleFilter::SetAssociations(Particle particle, std::vector<int> associations, std::vector<double> sense_x, std::vector<double> sense_y)
 {
